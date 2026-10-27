@@ -24,6 +24,16 @@ ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 MAX_IMAGES = 4
 
 
+def _graphql_get_lenient(
+    client: XClient, operation: str, variables: dict[str, Any]
+) -> dict[str, Any]:
+    """Run a GraphQL GET, returning {} instead of raising when the op is gone."""
+    try:
+        return client.graphql_get(operation, variables)
+    except APIError:
+        return {}
+
+
 def _extract_tweets_from_timeline(data: dict[str, Any]) -> TimelineResponse:
     """Extract tweets and cursors from a timeline-style API response."""
     tweets: list[Tweet] = []
@@ -34,30 +44,35 @@ def _extract_tweets_from_timeline(data: dict[str, Any]) -> TimelineResponse:
     instructions = _find_instructions(data)
 
     for instruction in instructions:
-        inst_type = instruction.get("type", "")
+        inst_type = instruction.get("type") or instruction.get("__typename", "")
 
         entries = []
-        if inst_type == "TimelineAddEntries":
+        if inst_type in ("TimelineAddEntries", "TimelineTimeline"):
             entries = instruction.get("entries", [])
         elif inst_type == "TimelineAddToModule":
             entries = instruction.get("moduleItems", [])
+        elif "entries" in instruction:
+            entries = instruction.get("entries", [])
+        elif "moduleItems" in instruction:
+            entries = instruction.get("moduleItems", [])
 
         for entry in entries:
-            entry_id = entry.get("entryId", "")
+            entry_id = entry.get("entryId") or entry.get("entry_id", "")
             content = entry.get("content", {})
+            item_content = _timeline_item_content(content)
 
             if entry_id.startswith("cursor-top"):
                 cursor_top = content.get("value") or _extract_cursor(content)
             elif entry_id.startswith("cursor-bottom"):
                 cursor_bottom = content.get("value") or _extract_cursor(content)
-            elif "itemContent" in content:
-                tweet = _parse_tweet_entry(content["itemContent"])
+            elif item_content:
+                tweet = _parse_tweet_entry(item_content)
                 if tweet:
                     tweets.append(tweet)
-            elif content.get("entryType") == "TimelineTimelineModule":
+            elif _field(content, "entryType", "__typename") == "TimelineTimelineModule":
                 for item in content.get("items", []):
-                    item_content = item.get("item", {}).get("itemContent", {})
-                    tweet = _parse_tweet_entry(item_content)
+                    nested_content = item.get("item", {})
+                    tweet = _parse_tweet_entry(_timeline_item_content(nested_content))
                     if tweet:
                         tweets.append(tweet)
 
@@ -74,9 +89,26 @@ def _find_instructions(data: dict[str, Any]) -> list[dict]:
     # Try common paths
     for path in [
         ["data", "home", "home_timeline_urt", "instructions"],
+        ["data", "home_timeline", "home_timeline_urt", "instructions"],
         ["data", "search_by_raw_query", "search_timeline", "timeline", "instructions"],
         ["data", "user", "result", "timeline_v2", "timeline", "instructions"],
         ["data", "user", "result", "timeline", "timeline", "instructions"],
+        [
+            "data",
+            "user_result_by_screen_name",
+            "result",
+            "profile_timeline_v2",
+            "timeline",
+            "instructions",
+        ],
+        [
+            "data",
+            "user_result_by_screen_name",
+            "result",
+            "profile_with_replies_timeline_v2",
+            "timeline",
+            "instructions",
+        ],
         ["data", "bookmark_timeline_v2", "timeline", "instructions"],
         ["data", "bookmark_timeline", "timeline", "instructions"],
         ["data", "bookmark_collection_timeline", "timeline", "instructions"],
@@ -104,17 +136,41 @@ def _find_instructions(data: dict[str, Any]) -> list[dict]:
 
 def _extract_cursor(content: dict[str, Any]) -> str | None:
     """Extract cursor value from content."""
-    cursor_type = content.get("cursorType")
+    cursor_type = content.get("cursorType") or content.get("cursor_type")
     if cursor_type:
         return content.get("value")
     # Try nested
-    item = content.get("itemContent", {})
+    item = content.get("itemContent") or content.get("item_content") or content.get("content", {})
     return item.get("value")
+
+
+def _field(data: dict[str, Any], *names: str) -> Any:
+    """Return the first present field from a GraphQL result dict."""
+    for name in names:
+        if name in data:
+            return data[name]
+    return None
+
+
+def _timeline_item_content(content: dict[str, Any]) -> dict[str, Any]:
+    """Normalize legacy and Relay timeline item wrappers."""
+    if not isinstance(content, dict):
+        return {}
+    if "itemContent" in content:
+        return content.get("itemContent") or {}
+    if "item_content" in content:
+        return content.get("item_content") or {}
+    nested = content.get("content")
+    if isinstance(nested, dict):
+        return nested
+    if _field(content, "itemType", "__typename") == "TimelineTweet":
+        return content
+    return {}
 
 
 def _parse_tweet_entry(item_content: dict[str, Any]) -> Tweet | None:
     """Parse a tweet from a timeline entry's itemContent."""
-    if item_content.get("itemType") != "TimelineTweet":
+    if _field(item_content, "itemType", "__typename") != "TimelineTweet":
         return None
 
     tweet_results = item_content.get("tweet_results", {})
@@ -165,6 +221,9 @@ def get_tweet_detail(client: XClient, tweet_id: str) -> list[Tweet]:
     """Fetch a tweet and its conversation thread."""
     variables = {
         "focalTweetId": tweet_id,
+        "cursor": None,
+        "rankingMode": None,
+        "referrer": None,
         "with_rux_injections": False,
         "includePromotedContent": False,
         "withCommunity": True,
@@ -172,6 +231,8 @@ def get_tweet_detail(client: XClient, tweet_id: str) -> list[Tweet]:
         "withBirdwatchNotes": True,
         "withVoice": True,
         "withV2Timeline": True,
+        "withFocalTweet": True,
+        "__relay_internal__pv__appviewerisloggedinprovider": True,
     }
 
     data = client.graphql_get("TweetDetail", variables)
@@ -187,17 +248,25 @@ def get_tweet_detail(client: XClient, tweet_id: str) -> list[Tweet]:
     for instruction in instructions:
         for entry in instruction.get("entries", []):
             content = entry.get("content", {})
+            item_content = _timeline_item_content(content)
 
-            if "itemContent" in content:
-                tweet = _parse_tweet_entry(content["itemContent"])
+            if item_content:
+                tweet = _parse_tweet_entry(item_content)
                 if tweet:
                     tweets.append(tweet)
-            elif content.get("entryType") == "TimelineTimelineModule":
+            elif _field(content, "entryType", "__typename") == "TimelineTimelineModule":
                 for item in content.get("items", []):
-                    item_content = item.get("item", {}).get("itemContent", {})
-                    tweet = _parse_tweet_entry(item_content)
+                    tweet = _parse_tweet_entry(_timeline_item_content(item.get("item", {})))
                     if tweet:
                         tweets.append(tweet)
+
+    # Fallback: single-tweet x-web shape (TweetDetail now returns tweet_result_by_rest_id)
+    if not tweets:
+        result = data.get("data", {}).get("tweet_result_by_rest_id", {}).get("result")
+        if isinstance(result, dict) and "legacy" in result:
+            tweet = Tweet.from_api_result(result)
+            if tweet:
+                tweets.append(tweet)
 
     return tweets
 
@@ -210,11 +279,15 @@ def search_tweets(
     cursor: str | None = None,
 ) -> TimelineResponse:
     """Search for tweets."""
+    # X requires capitalized product values ("Latest", "Top", ...);
+    # agents/CLI users typically pass lowercase -t latest.
+    search_type = search_type.capitalize()
     variables: dict[str, Any] = {
         "rawQuery": query,
         "count": count,
         "querySource": "typed_query",
         "product": search_type,
+        "__relay_internal__pv__appviewerisloggedinprovider": True,
     }
     if cursor:
         variables["cursor"] = cursor
@@ -227,11 +300,16 @@ def get_user_by_handle(client: XClient, handle: str) -> User | None:
     """Fetch user profile by screen name."""
     variables = {
         "screen_name": handle,
+        "screenName": handle,
         "withSafetyModeUserFields": True,
+        "__relay_internal__pv__appviewerisloggedinprovider": True,
     }
 
     data = client.graphql_get("UserByScreenName", variables)
-    result = data.get("data", {}).get("user", {}).get("result", {})
+    result = (
+        data.get("data", {}).get("user", {}).get("result", {})
+        or data.get("data", {}).get("user_result_by_screen_name", {}).get("result", {})
+    )
 
     if not result or result.get("__typename") == "UserUnavailable":
         return None
@@ -245,17 +323,20 @@ def get_user_tweets(
     count: int = 20,
     cursor: str | None = None,
     include_replies: bool = False,
+    screen_name: str | None = None,
 ) -> TimelineResponse:
     """Fetch tweets from a user."""
     operation = "UserTweetsAndReplies" if include_replies else "UserTweets"
 
     variables: dict[str, Any] = {
         "userId": user_id,
+        "screenName": screen_name or user_id,
         "count": count,
         "includePromotedContent": False,
         "withQuickPromoteEligibilityTweetFields": False,
         "withVoice": True,
         "withV2Timeline": True,
+        "__relay_internal__pv__appviewerisloggedinprovider": True,
     }
     if cursor:
         variables["cursor"] = cursor
@@ -354,6 +435,7 @@ def get_bookmarks(
         "count": count,
         "includePromotedContent": False,
         "rawQuery": "a OR e OR i OR o OR u OR t OR s OR n OR r OR l",
+        "__relay_internal__pv__appviewerisloggedinprovider": True,
     }
     if cursor:
         variables["cursor"] = cursor
@@ -504,7 +586,7 @@ def get_tweets_by_ids(client: XClient, tweet_ids: list[str]) -> list[Tweet]:
         "withCommunity": True,
         "withQuickPromoteEligibilityTweetFields": False,
     }
-    data = client.graphql_get("TweetResultsByRestIds", variables)
+    data = _graphql_get_lenient(client, "TweetResultsByRestIds", variables)
 
     results = data.get("data", {}).get("tweetResult", [])
     tweets: list[Tweet] = []
@@ -517,6 +599,14 @@ def get_tweets_by_ids(client: XClient, tweet_ids: list[str]) -> list[Tweet]:
         tweet = Tweet.from_api_result(result)
         if tweet:
             tweets.append(tweet)
+    if not tweets:
+        # The batch operation frequently disappears from X's x-web bundles;
+        # fall back to per-ID TweetDetail fetches, which are more stable.
+        for tweet_id in tweet_ids:
+            try:
+                tweets.extend(get_tweet_detail(client, tweet_id))
+            except APIError:
+                continue
     return tweets
 
 
@@ -1007,7 +1097,7 @@ def download_tweet_media(client: XClient, tweet_id: str, output_dir: str = ".") 
 
 def get_trending(client: XClient) -> list[dict[str, Any]]:
     """Get trending topics from the Explore page."""
-    data = client.graphql_get("ExplorePage", {})
+    data = client.graphql_get("ExplorePage", {"count": 30})
     return _parse_trends(data)
 
 
@@ -1027,6 +1117,11 @@ def _parse_trends(data: dict[str, Any]) -> list[dict[str, Any]]:
         .get("timeline", {})
         .get("timeline", {})
     )
+    if not timeline:
+        # Current x-web shape: data.trending_explore_mixer_timeline.timeline
+        timeline = (
+            data.get("data", {}).get("trending_explore_mixer_timeline", {}).get("timeline", {})
+        )
     if not timeline:
         # Fall back to legacy guide.json format
         timeline = data.get("timeline", {})
@@ -1074,11 +1169,13 @@ def _extract_trend_from_content(content: dict[str, Any]) -> dict[str, Any] | Non
         social_text = content.get("social_context", {}).get("text", "")
         tweet_count = _parse_tweet_volume(social_text)
 
-        # URL from trend_metadata or trend_url
+        # URL from trend_metadata or the trend's own url field
         trend_url = ""
-        url_obj = content.get("trend_metadata", {}).get("url", {})
+        url_obj = content.get("trend_metadata", {}).get("url", {}) or content.get("url", {})
         if isinstance(url_obj, dict):
             trend_url = url_obj.get("url", "")
+        elif isinstance(url_obj, str):
+            trend_url = url_obj
 
         return {
             "name": name,

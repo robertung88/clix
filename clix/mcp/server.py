@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp >= 2.0 renamed FastMCP to MCPServer
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP
 
 from clix.core.api import (
     add_list_member as _add_list_member,

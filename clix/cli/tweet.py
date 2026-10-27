@@ -41,6 +41,12 @@ def tweet(
 
     validate_output_flags(json_output, yaml_output)
 
+    # Normalize: accept a full x.com/twitter.com/.../status/<id> URL or raw ID
+    import re as _re
+    _m = _re.search(r"(?:x\.com|twitter\.com)/[^/\s]+/status/(\d+)", tweet_id)
+    if _m:
+        tweet_id = _m.group(1)
+
     from clix.core.api import get_article, get_tweet_detail
 
     with get_client(account) as client:

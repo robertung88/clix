@@ -49,6 +49,109 @@ logger = logging.getLogger(__name__)
 # Transaction cache settings
 _TRANSACTION_CACHE_FILE = "transaction_cache.json"
 _TRANSACTION_CACHE_TTL = 3600  # 1 hour
+_RELAY_IS_LOGGED_IN_PROVIDER = "__relay_internal__pv__appviewerisloggedinprovider"
+_RELAY_XCLIENTS_IS_LOGGED_IN_PROVIDER = "__relay_internal__pv__xclientsfeaturesappviewerisloggedinprovider"
+_RELAY_XCLIENTS_IS_LOGGED_IN_RELAY_PROVIDER = "__relay_internal__pv__xclientsfeaturesappviewerisloggedinrelayprovider"
+_RELAY_XCLIENTS_TRANSLATION_NOTE_RELAY_PROVIDER = "__relay_internal__pv__xclientsfeaturestranslationnoteautotranslationenabledrelayprovider"
+_RELAY_XCLIENTS_GROK_TRANSLATED_RELAY_PROVIDER = "__relay_internal__pv__xclientsfeaturestranslationgroktranslatedpostenabledrelayprovider"
+
+
+def _extract_missing_variable(response_data: Any) -> str | None:
+    """Return the variable name X reported as required in a 422 body."""
+    if isinstance(response_data, (str, bytes)):
+        try:
+            response_data = json.loads(response_data)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+    if not isinstance(response_data, dict):
+        return None
+    errors = response_data.get("errors") or []
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        path = err.get("path") or []
+        if len(path) >= 2 and path[0] == "variable" and isinstance(path[1], str):
+            return path[1]
+    return None
+
+
+def _guess_missing_variable_value(
+    name: str, variables: dict[str, Any], existing: dict[str, Any]
+) -> Any:
+    """Best-effort value for a variable X newly requires.
+
+    Relay provider flags are all booleans; scalars carry an ID or a cursor.
+    """
+    lowered = name.lower()
+    normalized = "".join(ch for ch in lowered if ch.isalnum())
+    if lowered.startswith("__relay_internal__pv__"):
+        return True
+    if normalized in {"restid", "focaltweetid", "tweetid"} or normalized.endswith("tweetid"):
+        return (
+            variables.get("tweetId")
+            or variables.get("focalTweetId")
+            or variables.get("restId")
+        )
+    if normalized.endswith("screenname"):
+        return variables.get("screenName") or variables.get("screen_name")
+    if normalized in {"cursor", "referrer", "rankingmode"}:
+        return None
+    # X's remaining toggles in this family are boolean feature flags.
+    if any(isinstance(value, bool) for value in existing.values()):
+        return True
+    return True
+
+
+def _adapt_graphql_variables(
+    operation: str,
+    endpoint_operation: str,
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    """Add x-web Relay variables while preserving legacy API variables."""
+    adapted = dict(variables)
+
+    if endpoint_operation in {
+        "SearchByRawQuery",
+        "TweetDetail",
+        "UserByScreenName",
+        "UserTweets",
+        "TweetResultByRestId",
+        "bookmarksQuery",
+        "homeQuery",
+        "homeFollowingQuery",
+        "HomeTimelineQuery",
+        "HomeLatestTimelineQuery",
+        "exploreForYouQuery",
+        "exploreTrendsQuery",
+    }:
+        adapted.setdefault(_RELAY_IS_LOGGED_IN_PROVIDER, True)
+        adapted.setdefault(_RELAY_XCLIENTS_IS_LOGGED_IN_PROVIDER, True)
+        adapted.setdefault(_RELAY_XCLIENTS_IS_LOGGED_IN_RELAY_PROVIDER, True)
+        adapted.setdefault(_RELAY_XCLIENTS_TRANSLATION_NOTE_RELAY_PROVIDER, True)
+        adapted.setdefault(_RELAY_XCLIENTS_GROK_TRANSLATED_RELAY_PROVIDER, True)
+
+    if endpoint_operation in {"SearchByRawQuery", "SearchTimeline"}:
+        adapted.setdefault("withMediaGridTweet", True)
+
+    if endpoint_operation == "UserByScreenName" and "screenName" not in adapted:
+        screen_name = adapted.get("screen_name")
+        if screen_name is not None:
+            adapted["screenName"] = screen_name
+
+    if endpoint_operation == "TweetDetail":
+        adapted.setdefault("cursor", None)
+        adapted.setdefault("rankingMode", None)
+        adapted.setdefault("referrer", None)
+
+    if endpoint_operation == "TweetResultByRestId" and "restId" not in adapted:
+        tweet_id = adapted.get("tweetId") or adapted.get("focalTweetId")
+        if tweet_id is not None:
+            adapted["restId"] = tweet_id
+
+    if endpoint_operation == "TweetResultByRestId":
+        adapted.setdefault("withFocalTweet", True)
+
+    return adapted
 
 
 def _transaction_cache_path() -> Path:
@@ -324,22 +427,30 @@ class XClient:
                 )
 
                 if response.status_code == 200:
-                    data = response.json()
+                    payload = response.json()
                     # X GraphQL can return HTTP 200 with application-level
                     # errors in the body (e.g. code 104 "not allowed").
                     # Only raise when there is no data — some responses
                     # include both warnings and valid data.
-                    errors = data.get("errors") if isinstance(data, dict) else None
-                    if errors and not data.get("data"):
+                    errors = payload.get("errors") if isinstance(payload, dict) else None
+                    if errors and not payload.get("data"):
                         first = errors[0]
                         code = first.get("code", 0)
                         msg = first.get("message", "Unknown error")
+                        # "Dependency: Unspecified" is X-side flakiness on the
+                        # jobs/explore backends; retry before giving up.
+                        if msg.startswith("Dependency") and attempt < max_retries - 1:
+                            logger.warning(
+                                "Transient X error '%s' on %s — retrying", msg, url
+                            )
+                            backoff_delay(attempt)
+                            continue
                         raise APIError(
                             f"API error (code {code}): {msg}",
                             status_code=200,
-                            response_data=data,
+                            response_data=payload,
                         )
-                    return data
+                    return payload
                 elif response.status_code == 401:
                     refreshed = self._try_refresh_credentials()
                     if refreshed:
@@ -425,8 +536,11 @@ class XClient:
         resolved_features = features if features is not None else get_op_features(operation)
         resolved_toggles = field_toggles if field_toggles is not None else DEFAULT_FIELD_TOGGLES
         current_method = method
+        extra_variables: dict[str, Any] = {}
+        fixups = 0
 
-        for attempt in range(3):
+        attempt = 0
+        while attempt < 3:
             endpoints = get_graphql_endpoints()
             endpoint = endpoints.get(operation)
             if not endpoint:
@@ -436,11 +550,19 @@ class XClient:
                     f"Available: {', '.join(sorted(endpoints.keys()))}"
                 )
             url = f"{GRAPHQL_BASE}/{endpoint}"
+            endpoint_operation = endpoint.split("/", 1)[1]
+            request_variables = _adapt_graphql_variables(
+                operation,
+                endpoint_operation,
+                variables,
+            )
+            if extra_variables:
+                request_variables.update(extra_variables)
 
             if current_method == "GET":
                 kwargs: dict[str, Any] = {
                     "params": {
-                        "variables": json.dumps(variables),
+                        "variables": json.dumps(request_variables),
                         "features": json.dumps(resolved_features),
                         "fieldToggles": json.dumps(resolved_toggles),
                     }
@@ -448,7 +570,7 @@ class XClient:
             else:
                 kwargs = {
                     "json_data": {
-                        "variables": variables,
+                        "variables": request_variables,
                         "features": resolved_features,
                         "queryId": endpoint.split("/")[0],
                     }
@@ -468,6 +590,7 @@ class XClient:
                     invalidate_cache()
                     if features is None:
                         resolved_features = get_op_features(operation)
+                    attempt += 1
                     continue
                 if attempt == 1 and method == "GET":
                     logger.warning(
@@ -476,6 +599,7 @@ class XClient:
                         operation,
                     )
                     current_method = "POST"
+                    attempt += 1
                     continue
                 raise APIError(
                     f"GraphQL endpoint '{operation}' not found (HTTP 404) "
@@ -484,19 +608,49 @@ class XClient:
                     status_code=404,
                 )
             except APIError as e:
-                if e.status_code == 422 and attempt == 0:
+                if e.status_code != 422:
+                    raise
+                _body = json.dumps(e.response_data) if e.response_data else ""
+                if "GRAPHQL_VALIDATION_FAILED" in _body and "must be defined" in _body:
+                    # Query ID is valid (the server parsed the request); the
+                    # variables we send are incomplete. X adds these Relay
+                    # variables periodically, so learn the missing name, add
+                    # it, and retry — wiping the cache cannot help.
+                    missing = _extract_missing_variable(e.response_data)
+                    if missing and missing not in request_variables and fixups < 8:
+                        value = _guess_missing_variable_value(
+                            missing, variables, request_variables
+                        )
+                        extra_variables[missing] = value
+                        fixups += 1
+                        logger.warning(
+                            "HTTP 422 for '%s' — adding missing variable "
+                            "%s=%r and retrying",
+                            operation,
+                            missing,
+                            value,
+                        )
+                        continue
                     logger.warning(
-                        "HTTP 422 for '%s' — variables or query ID may be stale, "
-                        "invalidating cache and retrying with fresh IDs. "
-                        "Response: %s",
+                        "HTTP 422 for '%s' — missing required Relay variable "
+                        "that could not be satisfied; query ID is valid, "
+                        "keeping cache. Response: %s",
                         operation,
                         e.response_data,
                     )
-                    invalidate_cache()
-                    if features is None:
-                        resolved_features = get_op_features(operation)
-                    continue
-                raise
+                    raise
+                logger.warning(
+                    "HTTP 422 for '%s' — variables or query ID may be stale, "
+                    "invalidating cache and retrying with fresh IDs. "
+                    "Response: %s",
+                    operation,
+                    e.response_data,
+                )
+                invalidate_cache()
+                if features is None:
+                    resolved_features = get_op_features(operation)
+                attempt += 1
+                continue
         raise APIError(f"Unreachable: _graphql_request retry loop for '{operation}'")
 
     def rest_get(
